@@ -42,7 +42,7 @@ jobs:
           ATTEMPT_ID: ${{ inputs.attempt_id }}
           EVENTCTL: ${{ steps.eventctl.outputs.path }}
           SCORER_PASSPHRASE: ${{ secrets.SMOKE_SCORER_PASSPHRASE }}
-          SCORER_SIGNING_KEY: ${{ secrets.SMOKE_SCORER_SIGNING_KEY }}
+          SCORER_SIGNING_KEY_B64: ${{ secrets.SMOKE_SCORER_SIGNING_KEY_B64 }}
           RUN_ID: ${{ github.run_id }}
         shell: bash
         run: |
@@ -59,7 +59,7 @@ jobs:
           test "$(sha256sum "$bundle" | awk '{print $1}')" = "$payload_sha256"
           python3 event/smoke_score.py --attempt-id "$ATTEMPT_ID" --team-id "$team_id" --payload-sha256 "$payload_sha256" --submission-sha256 "$submission_sha256" --bundle "$bundle" --output "$RUNNER_TEMP/score.json"
           jq -e -cS --arg purpose smoke-score-result --arg team "$team_id" --arg attempt "$ATTEMPT_ID" --arg artifact "github-run-$RUN_ID" '{v:2,kind:"stream-binding",event:.event,purpose:$purpose,team_id:$team,attempt_id:$attempt,artifact_id:$artifact}' registry-branch/registry/state.json > "$RUNNER_TEMP/stream-binding.json"
-          printf '%s' "$SCORER_SIGNING_KEY" > "$RUNNER_TEMP/scorer-signing.private.age"
+          printf '%s' "$SCORER_SIGNING_KEY_B64" | base64 --decode > "$RUNNER_TEMP/scorer-signing.private.age"
           printf '%s' "$SCORER_PASSPHRASE" > "$RUNNER_TEMP/scorer-passphrase"
           chmod 600 "$RUNNER_TEMP/scorer-signing.private.age" "$RUNNER_TEMP/scorer-passphrase"
           recipient_args=()
