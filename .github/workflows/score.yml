@@ -1,0 +1,80 @@
+name: Smoke score artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      attempt_id:
+        description: Accepted submission attempt UUID.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  score:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: organizer-administration
+    steps:
+      - name: Check out trusted main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check out protected registry
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: registry
+          path: registry-branch
+          persist-credentials: false
+
+      - id: eventctl
+        name: Resolve pinned eventctl
+        uses: ./.github/actions/eventctl
+        with:
+          test-bin: ${{ env.EVENTCTL_E2E_BIN }}
+
+      - name: Score the accepted bundle and encrypt the result
+        env:
+          ATTEMPT_ID: ${{ inputs.attempt_id }}
+          EVENTCTL: ${{ steps.eventctl.outputs.path }}
+          SCORER_PASSPHRASE: ${{ secrets.SMOKE_SCORER_PASSPHRASE }}
+          SCORER_SIGNING_KEY: ${{ secrets.SMOKE_SCORER_SIGNING_KEY }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$ATTEMPT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+          attempt=$(jq -ec --arg attempt "$ATTEMPT_ID" '[.attempts[] | select(.attempt_id == $attempt)] | if length == 1 then .[0] else error("attempt is not recorded") end' registry-branch/registry/state.json)
+          team_id=$(jq -er '.team_id' <<< "$attempt")
+          payload_sha256=$(jq -er '.payload_sha256' <<< "$attempt")
+          submission_sha256=$(jq -er '.submission_sha256' <<< "$attempt")
+          request="requests/submissions/$ATTEMPT_ID/request.json"
+          bundle="requests/submissions/$ATTEMPT_ID/bundle"
+          test "$(jq -er '.team_id' "$request")" = "$team_id"
+          test "$(jq -er '.payload_sha256' "$request")" = "$payload_sha256"
+          test "$(sha256sum "$bundle" | awk '{print $1}')" = "$payload_sha256"
+          python3 event/smoke_score.py --attempt-id "$ATTEMPT_ID" --team-id "$team_id" --payload-sha256 "$payload_sha256" --submission-sha256 "$submission_sha256" --bundle "$bundle" --output "$RUNNER_TEMP/score.json"
+          jq -e -cS --arg purpose smoke-score-result --arg team "$team_id" --arg attempt "$ATTEMPT_ID" --arg artifact "github-run-$RUN_ID" '{v:2,kind:"stream-binding",event:.event,purpose:$purpose,team_id:$team,attempt_id:$attempt,artifact_id:$artifact}' registry-branch/registry/state.json > "$RUNNER_TEMP/stream-binding.json"
+          printf '%s' "$SCORER_SIGNING_KEY" > "$RUNNER_TEMP/scorer-signing.private.age"
+          printf '%s' "$SCORER_PASSPHRASE" > "$RUNNER_TEMP/scorer-passphrase"
+          chmod 600 "$RUNNER_TEMP/scorer-signing.private.age" "$RUNNER_TEMP/scorer-passphrase"
+          recipient_args=()
+          while IFS= read -r actor_id; do
+            recipient="$RUNNER_TEMP/recipient-$actor_id.json"
+            jq -ec --arg actor "$actor_id" '.identities[] | select(.actor_id == $actor) | .recipient_key' registry-branch/registry/state.json > "$recipient"
+            recipient_args+=(--enc-public-key "$recipient")
+          done < <(jq -er --arg team "$team_id" '.teams[] | select(.team_id == $team) | .members[].actor_id' registry-branch/registry/state.json)
+          "$EVENTCTL" sigcrypt --input "$RUNNER_TEMP/score.json" --output "$RUNNER_TEMP/score.json.eventctl" --context "$RUNNER_TEMP/stream-binding.json" --sig-private-key "$RUNNER_TEMP/scorer-signing.private.age" --passphrase-file "$RUNNER_TEMP/scorer-passphrase" "${recipient_args[@]}"
+
+      - name: Upload encrypted score artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2
+        with:
+          name: score-${{ inputs.attempt_id }}
+          path: |
+            ${{ runner.temp }}/score.json.eventctl
+            ${{ runner.temp }}/stream-binding.json
+          if-no-files-found: error
